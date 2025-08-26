@@ -4,12 +4,15 @@ import asyncio
 import json
 import os
 from datetime import datetime, timezone
+import time
 from typing import Any, Dict, List, Optional
 import contextlib
-import time
+from contextlib import asynccontextmanager
+
 from aiokafka import AIOKafkaConsumer
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from motor.motor_asyncio import AsyncIOMotorClient
+
 
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 KAFKA_CONSUMER_GROUP = os.getenv("KAFKA_CONSUMER_GROUP", "subscriber-group")
@@ -20,7 +23,30 @@ MONGO_DB = os.getenv("MONGO_DB", "news20")
 MONGO_COLLECTION = os.getenv("MONGO_COLLECTION", KAFKA_TOPIC)
 
 
-app = FastAPI(title=f"Subscriber - {KAFKA_TOPIC}", version="0.1.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    "Manage startup and shutdown: init MongoDB and Kafka consumer."
+    global mongo_client, consume_task, consumer
+    mongo_client = AsyncIOMotorClient(MONGO_URI)
+    await ensure_indexes()
+    consume_task = asyncio.create_task(consumer_loop())
+    try:
+        yield
+    finally:
+        if consume_task is not None:
+            consume_task.cancel()
+            with contextlib.suppress(Exception):
+                await consume_task
+        if consumer is not None:
+            with contextlib.suppress(Exception):
+                await consumer.stop()
+        if mongo_client is not None:
+            mongo_client.close()
+            mongo_client = None
+
+
+app = FastAPI(title=f"Subscriber - {KAFKA_TOPIC}", version="0.1.0", lifespan=lifespan)
+
 
 mongo_client: Optional[AsyncIOMotorClient] = None
 consumer: Optional[AIOKafkaConsumer] = None
@@ -28,18 +54,20 @@ consume_task: Optional[asyncio.Task] = None
 
 # Tracks last time /messages/new was called
 last_get_time: Optional[datetime] = None
- 
+
+
 async def ensure_indexes():
     "Ensure indexes are created on the MongoDB collection."
-    global mongo_client
-    if mongo_client is None:
-        mongo_client = AsyncIOMotorClient(MONGO_URI)
     db = mongo_client[MONGO_DB]
     coll = db[MONGO_COLLECTION]
     await coll.create_index("timestamp")
-    
+
+
+ 
+
+
 async def consumer_loop():
-    "Consume message from Kafka"
+    "Consume messages from Kafka and insert them into MongoDB."
     global consumer
     consumer = AIOKafkaConsumer(
         KAFKA_TOPIC,
@@ -49,7 +77,7 @@ async def consumer_loop():
         auto_offset_reset="earliest",
         value_deserializer=lambda v: json.loads(v.decode("utf-8")),
     )
-    # Retry until Kafka is available
+    # Retry until Kafka is available (max ~90s)
     deadline = time.time() + 90
     last_err: Exception | None = None
     while time.time() < deadline:
@@ -62,20 +90,21 @@ async def consumer_loop():
     else:
         raise RuntimeError(f"Failed to connect to Kafka at {KAFKA_BOOTSTRAP_SERVERS}") from last_err
     try:
-        db = mongo_client[MONGO_DB] # type: ignore
+        db = mongo_client[MONGO_DB]
         coll = db[MONGO_COLLECTION]
         async for msg in consumer:
             payload = msg.value
             doc = {
-                **payload, # type: ignore
+                **payload,
                 "timestamp": datetime.now(timezone.utc),
                 "topic": KAFKA_TOPIC,
             }
             await coll.insert_one(doc)
     finally:
         await consumer.stop()
-        
-        
+
+
+
 @app.get("/health")
 async def health() -> Dict[str, str]:
     return {"status": "ok", "topic": KAFKA_TOPIC}
@@ -83,8 +112,10 @@ async def health() -> Dict[str, str]:
 
 @app.get("/messages/all")
 async def get_all() -> List[Dict[str, Any]]:
-    "Get all messages from the database"
-    db = mongo_client[MONGO_DB] # type: ignore
+    "Get all messages from the database."
+    if mongo_client is None:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    db = mongo_client[MONGO_DB]
     coll = db[MONGO_COLLECTION]
     docs = []
     async for doc in coll.find().sort("_id", 1):
@@ -95,11 +126,14 @@ async def get_all() -> List[Dict[str, Any]]:
         docs.append(doc)
     return docs
 
+
 @app.get("/messages/new")
 async def get_new() -> List[Dict[str, Any]]:
     "Get new messages from the database."
     global last_get_time
-    db = mongo_client[MONGO_DB] # type: ignore
+    if mongo_client is None:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    db = mongo_client[MONGO_DB]
     coll = db[MONGO_COLLECTION]
 
     query = {}
@@ -122,3 +156,5 @@ async def get_new() -> List[Dict[str, Any]]:
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8001")))
+
+
